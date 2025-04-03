@@ -1,0 +1,306 @@
+<#
+.SYNOPSIS
+Estimates user work time based on Security Event Log entries (Logon, Logoff, Lock, Unlock).
+
+.DESCRIPTION
+This script queries the Security Event Log for specific events related to the current user's session state
+changes (Logon, Logoff, Screen Lock, Screen Unlock) within a defined time period.
+It calculates the total duration between "start work" events (Logon, Unlock) and subsequent
+"stop work" events (Logoff, Lock) to estimate active computer usage time.
+
+Requires running PowerShell as Administrator to access the Security Log.
+
+.PARAMETER StartDate
+The start date and time for querying events. Defaults to the beginning of the current day.
+
+.PARAMETER EndDate
+The end date and time for querying events. Defaults to the current time.
+
+.PARAMETER Days
+Alternative to StartDate. Specify the number of past days (including today) to analyze.
+If used, StartDate will be set to the beginning of that day range.
+
+.EXAMPLE
+.\Get-WorkTimeEstimate.ps1
+# Estimates work time for today (since midnight). Requires Admin rights.
+
+.EXAMPLE
+.\Get-WorkTimeEstimate.ps1 -Days 7 -Verbose
+# Estimates work time for the last 7 days (including today) with verbose output. Requires Admin rights.
+
+.EXAMPLE
+.\Get-WorkTimeEstimate.ps1 -StartDate (Get-Date).AddDays(-1).Date -EndDate (Get-Date).AddDays(-1).Date.AddHours(23).AddMinutes(59).AddSeconds(59)
+# Estimates work time for all of yesterday. Requires Admin rights.
+
+.NOTES
+- Requires Administrator privileges.
+- This is an ESTIMATION. It does not track idle time while unlocked.
+- Assumes locking/logging off when work stops and unlocking/logging on when it starts.
+- Relies on appropriate Audit Policy settings (Audit Logon Events) and sufficient Event Log size.
+- Event property indices (e.g., Properties[5] for SID, Properties[8] for LogonType) might be fragile across different Windows versions.
+- Windows Hello (Biometrics/PIN) typically trigger standard Logon/Unlock events and should be captured.
+- Event IDs used:
+    - Start Work: 4624 (Logon - Type 2 Interactive, Type 7 Unlock), 4802 (Session Unlock)
+    - Stop Work:  4634 (Logoff), 4803 (Session Lock), 4800 (Workstation Locked)
+
+.LINK
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4624
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4634
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4800
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4801 <- Often associated with 4802/4803
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4802
+https://learn.microsoft.com/en-us/windows/security/threat-protection/auditing/event-4803
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$false, ParameterSetName='DateRange')]
+    [DateTime]$StartDate = (Get-Date).Date, # Default to start of today
+
+    [Parameter(Mandatory=$false, ParameterSetName='DateRange')]
+    [DateTime]$EndDate = (Get-Date),        # Default to now
+
+    [Parameter(Mandatory=$false, ParameterSetName='Days')]
+    [int]$Days = 1                          # Default to 1 day (today)
+)
+
+# --- Initial Checks ---
+Write-Verbose "Running script with user: $($env:USERNAME)"
+
+# Check for Administrator privileges
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Warning "This script requires Administrator privileges to query the Security event log."
+    Write-Warning "Please re-run PowerShell as Administrator."
+    return # Exit script
+}
+
+# --- Parameter Handling ---
+if ($PSCmdlet.ParameterSetName -eq 'Days') {
+    $StartDate = (Get-Date).AddDays(-($Days - 1)).Date # Start of the day, N-1 days ago
+    $EndDate = Get-Date # End now
+    Write-Verbose "Using Days parameter. Analyzing from $StartDate to $EndDate"
+} else {
+     Write-Verbose "Using StartDate/EndDate parameters. Analyzing from $StartDate to $EndDate"
+}
+
+# --- Configuration ---
+$logName = 'Security'
+# Event IDs indicating the start of a potential work session
+# 4624: Logon (specifically Type 2 - Interactive, Type 7 - Unlock)
+# 4802: The workstation session was unlocked
+$startEventIDs = 4624, 4802
+
+# Event IDs indicating the end of a potential work session
+# 4634: Logoff
+# 4800: The workstation was locked
+# 4803: The workstation session was locked (often follows 4800)
+$stopEventIDs = 4634, 4800, 4803
+
+# Logon Types for Event 4624 that we consider "start work"
+# Type 2: Interactive (Logon at keyboard/console)
+# Type 7: Unlock (Workstation unlocked)
+$relevantLogonTypes = 2, 7
+
+# Get the SID of the current user to filter events
+try {
+    $currentUserSID = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    Write-Verbose "Current User SID: $currentUserSID"
+} catch {
+    Write-Error "Failed to get current user SID: $($_.Exception.Message)"
+    return
+}
+
+# --- Query Events ---
+$filter = @{
+    LogName   = $logName
+    ID        = $startEventIDs + $stopEventIDs
+    StartTime = $StartDate
+    EndTime   = $EndDate
+    # Filtering by UserId here directly is difficult/inefficient with FilterHashtable.
+    # We will filter by User SID *after* retrieving the events.
+}
+
+Write-Host "Querying Security Event Log for relevant events..."
+Write-Verbose "Querying Log: $logName | IDs: $($startEventIDs + $stopEventIDs) | Start: $StartDate | End: $EndDate"
+try {
+    $events = Get-WinEvent -FilterHashtable $filter -ErrorAction Stop
+} catch {
+    Write-Error "Failed to query Security log. Ensure Audit Policies are enabled and log is accessible. Error: $($_.Exception.Message)"
+    return # Exit script
+}
+
+if (-not $events) {
+    Write-Host "No relevant Logon/Logoff/Lock/Unlock events found in the specified period for *any* user."
+    return
+}
+
+Write-Verbose "Retrieved $($events.Count) initial events. Filtering for user '$($env:USERNAME)' ($currentUserSID)..."
+
+# Filter events for the current user and correct Logon Types
+$userEvents = @()
+foreach ($event in $events) {
+    $eventSID = $null
+    $logonType = $null
+
+    # Attempt to get the User SID (often Property 5 or 6 - check your system if needed)
+    # This index can be fragile!
+    try { $eventSID = $event.Properties[5].Value } catch {}
+    if (-not ($eventSID -is [System.Security.Principal.SecurityIdentifier])) {
+         try { $eventSID = $event.Properties[6].Value } catch {} # Try alternative index
+    }
+     if (-not ($eventSID -is [System.Security.Principal.SecurityIdentifier])) {
+         # Could add XML parsing here as a fallback if needed, but it's slow.
+         # Write-Verbose "Could not reliably determine SID for event RecordID $($event.RecordId)"
+         continue # Skip event if SID cannot be reliably determined
+    }
+
+
+    # If it's the current user's event...
+    if ($eventSID.Value -eq $currentUserSID) {
+        # If it's a logon event (4624), check the Logon Type (often Property 8)
+        # This index can be fragile!
+        if ($event.Id -eq 4624) {
+            try {
+                $logonType = $event.Properties[8].Value
+                if ($logonType -in $relevantLogonTypes) {
+                    $userEvents += $event # Add if Logon Type is relevant
+                    #Write-Verbose "Adding Event $($event.Id) RecId $($event.RecordId) Time $($event.TimeCreated) (Logon Type $logonType)"
+                } else {
+                    #Write-Verbose "Skipping Event 4624 RecId $($event.RecordId) Time $($event.TimeCreated) (Logon Type $logonType - irrelevant)"
+                }
+            } catch {
+                Write-Warning "Could not determine Logon Type for event RecordID $($event.RecordId). Skipping."
+            }
+        } else {
+            # Add other relevant start/stop events for the user
+            $userEvents += $event
+            #Write-Verbose "Adding Event $($event.Id) RecId $($event.RecordId) Time $($event.TimeCreated)"
+        }
+    }
+}
+
+# Sort the filtered events by time
+$userEvents = $userEvents | Sort-Object TimeCreated
+
+if (-not $userEvents) {
+    Write-Host "No relevant Logon/Logoff/Lock/Unlock events found for user '$($env:USERNAME)' ($currentUserSID) in the specified period."
+    return
+}
+
+Write-Verbose "Found $($userEvents.Count) relevant events for user '$($env:USERNAME)'. Processing..."
+
+# --- Calculate Time ---
+$totalWorkTime = [TimeSpan]::Zero
+$sessionStartTime = $null
+$isWorking = $false # Tracks if we are currently in an 'active' session
+
+# Determine initial state at the VERY beginning of the period ($StartDate)
+# Look for the last relevant event *before* $StartDate to see if a session was already active.
+$initialStateFilter = @{
+    LogName   = $logName
+    ID        = $startEventIDs + $stopEventIDs
+    EndTime   = $StartDate # Events up to the start of our analysis period
+    # No StartTime needed here, find the most recent one before $StartDate
+}
+try {
+    Write-Verbose "Checking state immediately before $StartDate..."
+    $eventsBeforeStart = Get-WinEvent -FilterHashtable $initialStateFilter -MaxEvents 100 -ErrorAction SilentlyContinue # Get a few recent ones
+    $lastEventBeforeStart = $eventsBeforeStart | Where-Object {
+         $sid = $null
+         try { $sid = $_.Properties[5].Value } catch {}
+         if (-not ($sid -is [System.Security.Principal.SecurityIdentifier])) { try { $sid = $_.Properties[6].Value } catch {} }
+         ($sid -is [System.Security.Principal.SecurityIdentifier]) -and ($sid.Value -eq $currentUserSID)
+    } | Sort-Object TimeCreated -Descending | Select-Object -First 1
+
+    if ($lastEventBeforeStart) {
+        Write-Verbose "Last relevant event before start period: ID $($lastEventBeforeStart.Id) at $($lastEventBeforeStart.TimeCreated)"
+        # Check if this last event was a 'start work' event
+        $isStartEvent = $false
+        if ($lastEventBeforeStart.Id -in $startEventIDs) {
+             if ($lastEventBeforeStart.Id -eq 4624) {
+                 $lt = try {$lastEventBeforeStart.Properties[8].Value} catch {$null}
+                 if ($lt -in $relevantLogonTypes) { $isStartEvent = $true }
+             } else {
+                 $isStartEvent = $true
+             }
+        }
+
+        if ($isStartEvent) {
+            # Session was likely active when the analysis period started
+            $isWorking = $true
+            $sessionStartTime = $StartDate # Start the session timer at the beginning of our analysis window
+            Write-Verbose "Session likely active at period start. Initializing session start time to $StartDate"
+        }
+    } else {
+         Write-Verbose "No relevant user events found before $StartDate. Assuming session was not active."
+    }
+
+} catch {
+    Write-Warning "Could not determine initial state before $StartDate. Error: $($_.Exception.Message). Assuming session was not active."
+}
+
+
+# Process the events within the specified period
+foreach ($event in $userEvents) {
+    $isStartEvent = $false
+    $isStopEvent = $false
+
+    if ($event.Id -in $startEventIDs) {
+        if ($event.Id -eq 4624) {
+            # We already pre-filtered 4624 by logon type, so assume it's relevant
+            $isStartEvent = $true
+        } else {
+            # Other start events (like 4802 Unlock)
+             $isStartEvent = $true
+        }
+    } elseif ($event.Id -in $stopEventIDs) {
+        $isStopEvent = $true
+    }
+
+    # --- State Machine Logic ---
+    if ($isStartEvent -and -not $isWorking) {
+        # Started working (Logon or Unlock)
+        $sessionStartTime = $event.TimeCreated
+        $isWorking = $true
+        Write-Verbose "Session Start: $($event.TimeCreated) (Event $($event.Id), Record $($event.RecordId))"
+    } elseif ($isStopEvent -and $isWorking) {
+        # Stopped working (Logoff or Lock)
+        $sessionDuration = $event.TimeCreated - $sessionStartTime
+        if ($sessionDuration.TotalSeconds -gt 0) {
+            $totalWorkTime += $sessionDuration
+            Write-Verbose "Session End:   $($event.TimeCreated) (Event $($event.Id), Record $($event.RecordId)). Duration: $sessionDuration. Total: $totalWorkTime"
+        } else {
+             Write-Verbose "Session End:   $($event.TimeCreated) (Event $($event.Id), Record $($event.RecordId)). Zero/Negative duration skipped."
+        }
+        $isWorking = $false
+        $sessionStartTime = $null
+    } elseif ($isStartEvent -and $isWorking) {
+        # Consecutive start events (e.g., Unlock right after Logon). Ignore, keep original start time.
+        Write-Verbose "Consecutive Start Event Ignored: $($event.TimeCreated) (Event $($event.Id), Record $($event.RecordId))"
+    } elseif ($isStopEvent -and -not $isWorking) {
+        # Consecutive stop events (e.g., Lock then Logoff). Ignore.
+         Write-Verbose "Consecutive Stop Event Ignored: $($event.TimeCreated) (Event $($event.Id), Record $($event.RecordId))"
+    }
+}
+
+# Handle session still active at the end of the queried period
+if ($isWorking -and $sessionStartTime -ne $null) {
+    # If the last event was a start event, calculate duration up to the EndDate
+    $finalSessionDuration = $EndDate - $sessionStartTime
+     if ($finalSessionDuration.TotalSeconds -gt 0) {
+        $totalWorkTime += $finalSessionDuration
+        Write-Verbose "Ongoing session at end time ($EndDate). Duration added: $finalSessionDuration. Final Total: $totalWorkTime"
+     }
+}
+
+# --- Output Result ---
+Write-Host "-------------------------------------" -ForegroundColor Green
+Write-Host "Estimated Work Time Calculation" -ForegroundColor Green
+Write-Host "User:          $($env.USERNAME) ($currentUserSID)"
+Write-Host "Period Start:  $StartDate"
+Write-Host "Period End:    $EndDate"
+Write-Host "Total Estimated Time: $($totalWorkTime.ToString()) (HH:MM:SS)" -ForegroundColor Yellow
+Write-Host "-------------------------------------" -ForegroundColor Green
+Write-Host "Note: This is an ESTIMATION based on Logon/Logoff/Lock/Unlock events."
+Write-Host "It does NOT account for idle time while the screen is unlocked."
+Write-Host "Accuracy depends on event log availability and audit policy settings."
+Write-Host "Requires Administrator Privileges to run."
